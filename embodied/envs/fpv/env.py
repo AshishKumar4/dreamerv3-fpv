@@ -13,7 +13,7 @@ import elements
 import embodied
 
 from embodied.envs.fpv.backends.base import SimulatorBackend
-from embodied.envs.fpv.rewards.base import RewardStrategy
+from embodied.envs.fpv.rewards.base import RewardStrategy, RewardInfo
 from embodied.envs.fpv.waypoints.base import WaypointManager
 from embodied.envs.fpv.types import (
     DroneState,
@@ -81,6 +81,10 @@ class FPVEnv(embodied.Env):
 
         # Track last command for telemetry/debugging
         self._last_command: ControlCommand = ControlCommand.hover()
+
+        # Track last reward info for debugging/analysis
+        self._last_reward_info: Optional[RewardInfo] = None
+        self._last_waypoint_bonus: float = 0.0
 
         # Action logging for diagnostics
         self._episode_actions: List[np.ndarray] = []
@@ -180,6 +184,10 @@ class FPVEnv(embodied.Env):
             max_steps=self._env_config.max_steps,
             has_collided=has_collided,
         )
+
+        # Store for debugging/telemetry access
+        self._last_reward_info = reward_info
+        self._last_waypoint_bonus = waypoint_bonus
 
         # Add waypoint bonus
         total_reward = reward_info.total + waypoint_bonus
@@ -400,6 +408,14 @@ class FPVEnv(embodied.Env):
     def internal_state(self) -> Optional[DroneState]:
         """Get last known drone state (for debugging, not exposed to agent)."""
         return self._internal_state
+
+    @property
+    def reward_info(self) -> Optional[RewardInfo]:
+        return self._last_reward_info
+
+    @property
+    def waypoint_bonus(self) -> float:
+        return self._last_waypoint_bonus
 
     def get_info(self) -> Dict[str, Any]:
         """Get environment information for logging."""

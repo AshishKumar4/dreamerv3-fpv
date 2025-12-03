@@ -231,6 +231,8 @@ class RewardConfig:
     rate_penalty_control_hz: float = 100.0
     rate_yaw_weight: float = 0.3
     jerk_penalty_scale: float = 0.01
+    visibility_penalty: float = 0.0
+    camera_fov: float = 100.0
 
 
 @dataclass

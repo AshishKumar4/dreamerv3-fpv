@@ -8,6 +8,43 @@ from embodied.envs.fpv.types import DroneState, RewardConfig
 from embodied.envs.fpv.rewards.base import RewardStrategy, RewardInfo
 
 
+def _quat_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
+    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)],
+        [2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)]
+    ], dtype=np.float32)
+
+
+def _is_waypoint_outside_fov(
+    state: DroneState,
+    target_position: np.ndarray,
+    half_fov_rad: float,
+) -> bool:
+    """
+    Check if waypoint is outside camera field of view.
+    """
+    # Relative position in world frame (NED)
+    rel_world = target_position - state.position
+
+    # Transform to body frame (FRD: x=forward, y=right, z=down)
+    R = _quat_to_rotation_matrix(state.orientation)
+    rel_body = R.T @ rel_world
+
+    dx, dy, dz = rel_body
+
+    if dx <= 0:  # Waypoint is behind drone
+        return True
+
+    # Angular offset from forward direction (cone angle)
+    lateral_dist = np.sqrt(dy**2 + dz**2)
+    angular_offset = np.arctan2(lateral_dist, dx)
+
+    return angular_offset > half_fov_rad
+
+
 class NavigationReward(RewardStrategy):
     """Navigation reward for waypoint-following tasks."""
 
@@ -72,12 +109,19 @@ class NavigationReward(RewardStrategy):
         time_factor = 1 + step / cfg.time_penalty_growth
         info.time_penalty = cfg.time_penalty * time_factor
 
+        # Visibility penalty (waypoint outside FOV)
+        if cfg.visibility_penalty > 0:
+            half_fov_rad = np.deg2rad(cfg.camera_fov / 2.0)
+            if _is_waypoint_outside_fov(state, target_position, half_fov_rad):
+                info.visibility_penalty = -cfg.visibility_penalty
+
         info.total = (
             info.survival +
             info.progress +
             info.rate_penalty +
             info.jerk_penalty +
-            info.time_penalty
+            info.time_penalty +
+            info.visibility_penalty
         )
 
         return info

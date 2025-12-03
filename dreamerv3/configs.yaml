@@ -44,30 +44,32 @@ defaults:
       max_steps: 2000
       use_depth: false
       # Control
-      roll_scale: 4.0
-      pitch_scale: 4.0
-      yaw_scale: 4.0
+      roll_scale: 2.0
+      pitch_scale: 2.0
+      yaw_scale: 2.0
       throttle_hover: 0.35
       effective_range: 0.5
       # Reward
       gate_radius: 1.6
-      gate_bonus: 40.0
+      gate_bonus: 60.0
       gate_bonus_decay: true
       gate_size: 1.6
       gate_bonus_progressive: true
       gate_bonus_max_scale: 3.0
       collision_penalty: -25.0
       progress_scale: 5.0
-      progress_clip_min: -5
-      progress_clip_max: 5
+      progress_clip_min: -1
+      progress_clip_max: 1
       survival_bonus: 0.1
       survival_decay: 200.0
       time_penalty: -0.002
-      time_penalty_growth: 150.0
-      rate_penalty_scale: 0.05
+      time_penalty_growth: 300.0
+      rate_penalty_scale: 0.3
       rate_penalty_control_hz: 30.0
       rate_yaw_weight: 1
-      jerk_penalty_scale: 0.00
+      jerk_penalty_scale: 0.001
+      visibility_penalty: 1
+      camera_fov: 100.0
       # Waypoints
       visible_waypoints: 5
       show_spline: true
@@ -108,19 +110,6 @@ defaults:
           target_is_blueprint: true
           waypoint_is_blueprint: true
           spline_is_blueprint: false
-      flightmare:
-        flightmare_path: "/ntfs-gen4-1tb/RoboticsProject/flightmare"
-        scene_id: 0
-        render: true
-        camera_width: 640
-        camera_height: 360
-        camera_fov: 90.0
-        # Note: Rate scaling is handled by ControlConfig (roll_scale, pitch_scale, etc.)
-        # FlightController now accepts rate setpoints directly (in rad/s)
-        pid:
-          roll: {kp: 0.15, ki: 0.05, kd: 0.003}
-          pitch: {kp: 0.15, ki: 0.05, kd: 0.003}
-          yaw: {kp: 0.10, ki: 0.02, kd: 0.0}
       # Isaac Sim + Betaflight SITL backend (requires server running)
       # Start server: ./launch_pegasus.sh isaac_sim_server.py --port 5555
       isaacsim:
@@ -144,7 +133,7 @@ defaults:
   run:
     steps: 1e10
     duration: 0
-    train_ratio: 32.0
+    train_ratio: 128.0
     log_every: 120
     report_every: 300
     save_every: 900
@@ -204,8 +193,8 @@ defaults:
     policy_dist_disc: categorical
     policy_dist_cont: bounded_normal
     imag_last: 0
-    imag_length: 15
-    horizon: 333
+    imag_length: 20
+    horizon: 900
     contdisc: True
     imag_loss: {slowtar: False, lam: 0.95, actent: 1e-3, slowreg: 1.0}
     repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
@@ -300,7 +289,6 @@ loconav:
 # FPV Navigation
 fpv:
   task: fpv_navigation
-  # script: parallel
   batch_size: 16
   batch_length: 64
   replay.size: 1e6
@@ -335,9 +323,9 @@ fpv:
     policy_dist_cont: bounded_normal
     imag_last: 0
     imag_length: 20
-    horizon: 333
+    horizon: 600
     contdisc: True
-    imag_loss: {slowtar: False, lam: 0.95, actent: 5e-4, slowreg: 1.0}
+    imag_loss: {slowtar: False, lam: 0.95, actent: 1e-3, slowreg: 1.0}
     repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
     slowvalue: {rate: 0.02, every: 1}
     retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
@@ -350,29 +338,6 @@ fpv:
     report_gradnorms: False
 
   jax: {platform: 'cuda', policy_devices: [0], train_devices: [0], prealloc: True, precompile: True}
-
-fpv_flightmare:
-  task: fpv_navigation
-  env.fpv:
-    simulator: flightmare
-    waypoint_type: simple
-    use_depth: false
-    gate_radius: 2.0
-    static_gates:
-      - "8.0,0.0,-3.0"
-      - "18.0,0.0,-5.0"
-      - "30.0,0.0,-5.0"
-    flightmare:
-      scene_id: 0
-      render: true
-  batch_size: 16
-  batch_length: 64
-  replay.size: 1e6
-  run:
-    envs: 1
-    train_ratio: 128
-    steps: 1e6
-  jax: {platform: cuda, policy_devices: [0], train_devices: [0], prealloc: False, precompile: False}
 
 multicpu:
   batch_size: 12

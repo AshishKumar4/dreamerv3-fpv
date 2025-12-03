@@ -21,6 +21,7 @@ class RewardInfo:
     collision_penalty: float = 0.0
     rate_penalty: float = 0.0
     jerk_penalty: float = 0.0
+    visibility_penalty: float = 0.0
     is_terminal: bool = False
     distance_to_target: float = 0.0
 

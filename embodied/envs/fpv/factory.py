@@ -178,6 +178,8 @@ def build_reward_config(config: Dict[str, Any]) -> RewardConfig:
         gate_bonus=float(config.get("gate_bonus", defaults.gate_bonus)),
         gate_bonus_decay=bool(config.get("gate_bonus_decay", defaults.gate_bonus_decay)),
         gate_size=float(config.get("gate_size", defaults.gate_size)),
+        gate_bonus_progressive=bool(config.get("gate_bonus_progressive", defaults.gate_bonus_progressive)),
+        gate_bonus_max_scale=float(config.get("gate_bonus_max_scale", defaults.gate_bonus_max_scale)),
         collision_penalty=float(config.get("collision_penalty", defaults.collision_penalty)),
         progress_scale=float(config.get("progress_scale", defaults.progress_scale)),
         progress_clip_min=float(config.get("progress_clip_min", defaults.progress_clip_min)),
@@ -188,7 +190,10 @@ def build_reward_config(config: Dict[str, Any]) -> RewardConfig:
         time_penalty_growth=float(config.get("time_penalty_growth", defaults.time_penalty_growth)),
         rate_penalty_scale=float(config.get("rate_penalty_scale", defaults.rate_penalty_scale)),
         rate_penalty_control_hz=float(config.get("rate_penalty_control_hz", defaults.rate_penalty_control_hz)),
+        rate_yaw_weight=float(config.get("rate_yaw_weight", defaults.rate_yaw_weight)),
         jerk_penalty_scale=float(config.get("jerk_penalty_scale", defaults.jerk_penalty_scale)),
+        visibility_penalty=float(config.get("visibility_penalty", defaults.visibility_penalty)),
+        camera_fov=float(config.get("camera_fov", defaults.camera_fov)),
     )
 
 
