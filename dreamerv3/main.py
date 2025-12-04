@@ -120,6 +120,15 @@ def main(argv=None):
         bind(make_stream, config),
         args)
 
+  elif config.script == 'train_offline':
+    from embodied.run.train_offline import train_offline
+    train_offline(
+        bind(make_agent, config),
+        bind(make_replay, config, 'replay'),
+        bind(make_stream, config),
+        bind(make_logger, config),
+        args)
+
   else:
     raise NotImplementedError(config.script)
 
@@ -206,7 +215,16 @@ def make_replay(config, folder, mode='train'):
         recency=selectors.Recency(recency),
     ), config.replay.fracs)
 
-  return embodied.replay.Replay(**kwargs)
+  replay = embodied.replay.Replay(**kwargs)
+
+  if config.demo_data_dir and mode == 'train':
+    demo_dir = elements.Path(config.demo_data_dir)
+    if demo_dir.exists():
+      print(f'Loading demo data from {demo_dir}')
+      replay.load(directory=demo_dir)
+      print(f'Loaded {len(replay)} sequences from demos')
+
+  return replay
 
 
 def make_env(config, index, **overrides):

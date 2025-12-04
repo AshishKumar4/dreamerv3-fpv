@@ -14,6 +14,7 @@ defaults:
   consec_report: 1
   replay_context: 1
   random_agent: False
+  demo_data_dir: ''
   clock_addr: ''
   clock_port: ''
   ipv6: False
@@ -68,7 +69,7 @@ defaults:
       rate_penalty_control_hz: 30.0
       rate_yaw_weight: 1
       jerk_penalty_scale: 0.001
-      visibility_penalty: 1
+      visibility_penalty: 0.5
       camera_fov: 100.0
       # Waypoints
       visible_waypoints: 5
@@ -110,16 +111,6 @@ defaults:
           target_is_blueprint: true
           waypoint_is_blueprint: true
           spline_is_blueprint: false
-      # Isaac Sim + Betaflight SITL backend (requires server running)
-      # Start server: ./launch_pegasus.sh isaac_sim_server.py --port 5555
-      isaacsim:
-        host: localhost
-        port: 5555
-        shm_name: isaac_sim_fpv
-        camera_width: 640
-        camera_height: 480
-        timeout: 5.0
-        max_retries: 3
 
   replay:
     size: 5e6
@@ -322,7 +313,7 @@ fpv:
     policy_dist_disc: categorical
     policy_dist_cont: bounded_normal
     imag_last: 0
-    imag_length: 20
+    imag_length: 32
     horizon: 600
     contdisc: True
     imag_loss: {slowtar: False, lam: 0.95, actent: 1e-3, slowreg: 1.0}
@@ -338,6 +329,13 @@ fpv:
     report_gradnorms: False
 
   jax: {platform: 'cuda', policy_devices: [0], train_devices: [0], prealloc: True, precompile: True}
+
+pretrain_wm:
+  script: train_offline
+  demo_data_dir: ''
+  replay_context: 0
+  run: {envs: 0, train_ratio: 512, steps: 500000}
+  agent.loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 0.0, value: 0.0, repval: 0.0, aux_state: 1.0, aux_goal: 1.0}
 
 multicpu:
   batch_size: 12
