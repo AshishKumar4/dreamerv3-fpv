@@ -409,6 +409,115 @@ class Norm(nj.Module):
     return self.value('shift', jnp.zeros, shape, f32).astype(dtype)
 
 
+def memory_efficient_attention(q, k, v, causal=True, query_chunk_size=16, key_chunk_size=16):
+  B, T, H, D = q.shape
+  orig_dtype = q.dtype
+  precision = jax.lax.Precision.HIGHEST
+
+  # Pad T to be divisible by chunk sizes
+  num_q_chunks = (T + query_chunk_size - 1) // query_chunk_size
+  num_k_chunks = (T + key_chunk_size - 1) // key_chunk_size
+  T_q_padded = num_q_chunks * query_chunk_size
+  T_k_padded = num_k_chunks * key_chunk_size
+
+  # Pad inputs
+  pad_q = T_q_padded - T
+  pad_k = T_k_padded - T
+  if pad_q > 0:
+    q = jnp.pad(q, ((0, 0), (0, pad_q), (0, 0), (0, 0)))
+  if pad_k > 0:
+    k = jnp.pad(k, ((0, 0), (0, pad_k), (0, 0), (0, 0)))
+    v = jnp.pad(v, ((0, 0), (0, pad_k), (0, 0), (0, 0)))
+
+  # Work in float32 for numerical stability
+  q = q.astype(jnp.float32)
+  k = k.astype(jnp.float32)
+  v = v.astype(jnp.float32)
+
+  # Reshape into chunks: (B, num_chunks, chunk_size, H, D)
+  q_chunks = q.reshape(B, num_q_chunks, query_chunk_size, H, D)
+  k_chunks = k.reshape(B, num_k_chunks, key_chunk_size, H, D)
+  v_chunks = v.reshape(B, num_k_chunks, key_chunk_size, H, D)
+
+  def _compute_chunk_attention(q_chunk, k_chunk, v_chunk, q_idx, k_idx):
+    """Compute attention for one Q chunk against one K/V chunk."""
+    # q_chunk: (B, Qc, H, D), k_chunk: (B, Kc, H, D)
+    q_scaled = q_chunk / jnp.sqrt(D).astype(jnp.float32)
+
+    # (B, Qc, H, Kc)
+    attn_weights = jnp.einsum('bqhd,bkhd->bqhk', q_scaled, k_chunk, precision=precision)
+
+    # Causal mask based on absolute positions
+    if causal:
+      q_pos = jnp.arange(query_chunk_size) + q_idx * query_chunk_size
+      k_pos = jnp.arange(key_chunk_size) + k_idx * key_chunk_size
+      mask = q_pos[:, None] >= k_pos[None, :]  # (Qc, Kc)
+      big_neg = jnp.finfo(jnp.float32).min
+      attn_weights = jnp.where(mask[None, :, None, :], attn_weights, big_neg)
+
+    # Online softmax components
+    max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
+    max_score = jax.lax.stop_gradient(max_score)
+    exp_weights = jnp.exp(attn_weights - max_score)
+    exp_values = jnp.einsum('bkhd,bqhk->bqhd', v_chunk, exp_weights, precision=precision)
+    sum_weights = exp_weights.sum(axis=-1)  # (B, Qc, H)
+    return exp_values, sum_weights, max_score.squeeze(-1)
+
+  def _process_kv_chunk(carry, k_idx):
+    """Scan over key/value chunks for a single query chunk."""
+    acc_values, acc_weights, acc_max, q_chunk, q_idx = carry
+    k_chunk = k_chunks[:, k_idx]  # (B, Kc, H, D)
+    v_chunk = v_chunks[:, k_idx]  # (B, Kc, H, D)
+
+    # Checkpoint this computation to save backward memory
+    @jax.checkpoint
+    def _compute(q_c, k_c, v_c):
+      return _compute_chunk_attention(q_c, k_c, v_c, q_idx, k_idx)
+
+    chunk_values, chunk_weights, chunk_max = _compute(q_chunk, k_chunk, v_chunk)
+
+    # Online softmax update
+    new_max = jnp.maximum(acc_max, chunk_max)
+    acc_scale = jnp.exp(acc_max - new_max)
+    chunk_scale = jnp.exp(chunk_max - new_max)
+
+    acc_values = acc_values * acc_scale[..., None] + chunk_values * chunk_scale[..., None]
+    acc_weights = acc_weights * acc_scale + chunk_weights * chunk_scale
+    acc_max = new_max
+
+    return (acc_values, acc_weights, acc_max, q_chunk, q_idx), None
+
+  def _process_query_chunk(carry, q_idx):
+    """Scan over query chunks."""
+    q_chunk = q_chunks[:, q_idx]  # (B, Qc, H, D)
+
+    # Initialize accumulators
+    acc_values = jnp.zeros((B, query_chunk_size, H, D), dtype=jnp.float32)
+    acc_weights = jnp.zeros((B, query_chunk_size, H), dtype=jnp.float32)
+    acc_max = jnp.full((B, query_chunk_size, H), jnp.finfo(jnp.float32).min)
+
+    # Scan over all K/V chunks
+    (acc_values, acc_weights, acc_max, _, _), _ = jax.lax.scan(
+        _process_kv_chunk,
+        (acc_values, acc_weights, acc_max, q_chunk, q_idx),
+        jnp.arange(num_k_chunks),
+    )
+
+    output = acc_values / (acc_weights[..., None] + 1e-10)
+    return None, output
+
+  # Scan over all query chunks
+  _, outputs = jax.lax.scan(_process_query_chunk, None, jnp.arange(num_q_chunks))
+  # outputs: (num_q_chunks, B, Qc, H, D)
+
+  # Reshape and remove padding
+  outputs = outputs.transpose(1, 0, 2, 3, 4)  # (B, num_q_chunks, Qc, H, D)
+  outputs = outputs.reshape(B, T_q_padded, H, D)
+  outputs = outputs[:, :T]  # Remove padding
+
+  return outputs.astype(orig_dtype)
+
+
 class Attention(nj.Module):
 
   heads: int = 8
@@ -417,6 +526,11 @@ class Attention(nj.Module):
   rope: bool = True
   qknorm: str = 'none'
   bias: bool = True
+  flash: bool = True
+  causal: bool = False
+  chunked: bool = True
+  query_chunk_size: int = 16
+  key_chunk_size: int = 16
   winit: str | Callable = Initializer('trunc_normal')
   binit: str | Callable = Initializer('zeros')
   outscale: float = 1.0
@@ -446,20 +560,62 @@ class Attention(nj.Module):
       q = rope(q, ts)
       k = rope(k, ts)
 
-    q = einops.rearrange(q, 'b t (h g) d -> b t h g d', h=kv_heads)
-    logits = einops.einsum(q, k, 'b tq h g d, b tk h d -> b h g tq tk')
-    logits = logits * (1.0 / np.sqrt(k.shape[-1]))
-    logits = f32(logits)
-    if mask is not None:
-      Tq, Tk = q.shape[1], k.shape[1]
-      assert mask.shape == (B, Tq, Tk), (mask.shape, (B, Tq, Tk))
-      mask = einops.rearrange(mask, 'b tq tk -> b 1 1 tq tk')
-      logits = jnp.where(mask, logits, -1e30)
-    weights = jax.nn.softmax(logits)
-    weights = weights.astype(x.dtype)
-    weights = dropout(weights, self.dropout, training)
-    x = einops.einsum(weights, v, 'b h g tq tk, b tk h d -> b tq h g d')
-    x = einops.rearrange(x, 'b t h g d -> b t (h g d)')
+    # Check if we can use memory-efficient chunked attention
+    use_chunked = (
+        self.chunked and
+        head_ratio == 1 and  # No GQA
+        mask is None  # Only supports causal or no masking
+    )
+
+    # Check if we can use flash attention as fallback
+    use_flash = (
+        self.flash and
+        head_ratio == 1 and
+        mask is None
+    )
+
+    if use_chunked:
+      # Chunked attention path - O(sqrt(n)) memory
+      # Best for training with limited GPU memory
+      x = memory_efficient_attention(
+          q, k, v,
+          causal=self.causal,
+          query_chunk_size=self.query_chunk_size,
+          key_chunk_size=self.key_chunk_size,
+      )
+      # x is (B, T, H, D), reshape to (B, T, H*D)
+      x = einops.rearrange(x, 'b t h d -> b t (h d)')
+    elif use_flash:
+      # Flash attention path - O(T) memory via JAX built-in
+      x = jax.nn.dot_product_attention(
+          query=q,
+          key=k,
+          value=v,
+          is_causal=self.causal,
+      )
+      # x is (B, T, H, D), reshape to (B, T, H*D)
+      x = einops.rearrange(x, 'b t h d -> b t (h d)')
+    else:
+      q = einops.rearrange(q, 'b t (h g) d -> b t h g d', h=kv_heads)
+      logits = einops.einsum(q, k, 'b tq h g d, b tk h d -> b h g tq tk')
+      logits = logits * (1.0 / np.sqrt(k.shape[-1]))
+      logits = f32(logits)
+      if mask is not None:
+        Tq, Tk = q.shape[1], k.shape[1]
+        assert mask.shape == (B, Tq, Tk), (mask.shape, (B, Tq, Tk))
+        mask = einops.rearrange(mask, 'b tq tk -> b 1 1 tq tk')
+        logits = jnp.where(mask, logits, -1e30)
+      elif self.causal:
+        # Create causal mask for manual attention
+        causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+        causal_mask = causal_mask[None, None, None, :, :]
+        logits = jnp.where(causal_mask, logits, -1e30)
+      weights = jax.nn.softmax(logits)
+      weights = weights.astype(x.dtype)
+      weights = dropout(weights, self.dropout, training)
+      x = einops.einsum(weights, v, 'b h g tq tk, b tk h d -> b tq h g d')
+      x = einops.rearrange(x, 'b t h g d -> b t (h g d)')
+
     x = self.sub('proj', Linear, D, **kw, outscale=self.outscale)(x)
     return x
 

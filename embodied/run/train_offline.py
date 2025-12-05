@@ -37,12 +37,14 @@ def train_offline(make_agent, make_replay, make_stream, make_logger, args):
             f'Collect more demo data before pretraining.')
 
     pbar = tqdm(total=args.steps, initial=int(step), desc='Pretrain')
+    last_mets = {}
     while step < args.steps:
         batch = next(stream_train)
         carry[0], outs, mets = agent.train(carry[0], batch)
         train_fps.step(batch_steps)
         step.increment(batch_steps)
         train_agg.add(mets, prefix='train')
+        last_mets = mets
 
         if 'replay' in outs:
             replay.update(outs['replay'])
@@ -56,6 +58,15 @@ def train_offline(make_agent, make_replay, make_stream, make_logger, args):
         if should_save(step):
             cp.save()
 
+        # Update progress bar with key metrics
+        postfix = {'fps': f'{train_fps.result():.0f}'}
+        if 'opt/loss' in last_mets:
+            postfix['loss'] = f'{float(last_mets["opt/loss"]):.1f}'
+        if 'ret' in last_mets:
+            postfix['ret'] = f'{float(last_mets["ret"]):.2f}'
+        if 'adv_mag' in last_mets:
+            postfix['adv'] = f'{float(last_mets["adv_mag"]):.2f}'
+        pbar.set_postfix(postfix)
         pbar.update(batch_steps)
 
     cp.save()

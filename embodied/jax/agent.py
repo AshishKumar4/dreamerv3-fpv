@@ -338,6 +338,11 @@ class Agent(embodied.Agent):
       for key, value in data.items():
         if np.issubdtype(value.dtype, np.floating):
           assert not np.isnan(value).any(), (key, value)
+      # Fill missing latent state fields with zeros (for demo data without them)
+      for key, space in self.spaces.items():
+        if key not in data and key.startswith(('dyn/', 'enc/', 'dec/')):
+          shape = (data['image'].shape[0], data['image'].shape[1], *space.shape)
+          data[key] = np.zeros(shape, space.dtype)
       data = internal.device_put(data, self.train_sharded)
       with self.n_batches.lock:
         counter = self.n_batches.value

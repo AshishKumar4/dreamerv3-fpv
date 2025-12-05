@@ -176,6 +176,287 @@ class RSSM(nj.Module):
     return out
 
 
+class TSSM(nj.Module):
+  """Transformer State-Space Model - TransDreamer-style replacement for RSSM.
+
+  Key differences from RSSM:
+  - Uses transformer instead of GRU for dynamics (parallel training)
+  - Maintains stochastic latent structure for world model learning
+  - During training: processes full sequence in parallel with causal mask
+  - During imagination: still sequential (policy depends on current state)
+  """
+
+  deter: int = 1024
+  stoch: int = 32
+  classes: int = 32
+  layers: int = 4
+  heads: int = 8
+  ffup: int = 4
+  norm: str = 'rms'
+  act: str = 'silu'
+  unimix: float = 0.01
+  outscale: float = 1.0
+  obslayers: int = 1
+  imglayers: int = 2
+  free_nats: float = 1.0
+  rope: bool = True
+  qknorm: str = 'rms'
+  glu: bool = True
+
+  def __init__(self, act_space, **kw):
+    self.act_space = act_space
+    self.kw = kw
+
+  @property
+  def entry_space(self):
+    return dict(
+        deter=elements.Space(np.float32, self.deter),
+        stoch=elements.Space(np.float32, (self.stoch, self.classes)))
+
+  def initial(self, bsize):
+    carry = nn.cast(dict(
+        deter=jnp.zeros([bsize, self.deter], f32),
+        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32)))
+    return carry
+
+  def truncate(self, entries, carry=None):
+    assert entries['deter'].ndim == 3, entries['deter'].shape
+    carry = jax.tree.map(lambda x: x[:, -1], entries)
+    return carry
+
+  def starts(self, entries, carry, nlast):
+    B = len(jax.tree.leaves(carry)[0])
+    return jax.tree.map(
+        lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
+
+  def observe(self, carry, tokens, action, reset, training, single=False):
+    carry, tokens, action = nn.cast((carry, tokens, action))
+    if single:
+      carry, (entry, feat) = self._observe_single(
+          carry, tokens, action, reset, training)
+      return carry, entry, feat
+    else:
+      carry, entries, feat = self._observe_parallel(
+          carry, tokens, action, reset, training)
+      return carry, entries, feat
+
+  def _observe_single(self, carry, tokens, action, reset, training):
+    """Single-step observation (sequential, for inference)."""
+    deter, stoch, action = nn.mask(
+        (carry['deter'], carry['stoch'], action), ~reset)
+    action = nn.DictConcat(self.act_space, 1)(action)
+    action = nn.mask(action, ~reset)
+
+    stoch_flat = stoch.reshape((stoch.shape[0], -1))
+    x = jnp.concatenate([deter, stoch_flat, action], -1)
+    x = self.sub('imag_embed', nn.Linear, self.deter, **self.kw)(x)
+
+    for i in range(self.layers):
+      with nj.scope(f'layer{i}'):
+        skip = x
+        x = self.sub('norm1', nn.Norm, self.norm)(x)
+        # Skip attention for single step - no temporal context
+        x = skip
+        skip = x
+        x = self.sub('norm2', nn.Norm, self.norm)(x)
+        if self.glu:
+          D = x.shape[-1]
+          U = max(D, int((D * self.ffup * 2 / 3) // 32 * 32))
+          ff1 = self.sub('ff1', nn.Linear, U, **self.kw)
+          ff2 = self.sub('ff2', nn.Linear, U, **self.kw)
+          ff3 = self.sub('ff3', nn.Linear, D, **self.kw)
+          x = ff3(nn.act(self.act)(ff1(x)) * ff2(x))
+        else:
+          ff1 = self.sub('ff1', nn.Linear, self.deter * self.ffup, **self.kw)
+          ff2 = self.sub('ff2', nn.Linear, self.deter, **self.kw)
+          x = ff2(nn.act(self.act)(ff1(x)))
+        x += skip
+    deter = self.sub('outnorm', nn.Norm, self.norm)(x)
+
+    # Posterior from tokens
+    tokens_flat = tokens.reshape((*deter.shape[:-1], -1))
+    obs_inp = jnp.concatenate([deter, tokens_flat], -1)
+    for i in range(self.obslayers):
+      obs_inp = self.sub(f'obs{i}', nn.Linear, self.deter, **self.kw)(obs_inp)
+      obs_inp = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(obs_inp))
+    logit = self._logit('obslogit', obs_inp)
+    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+
+    carry = dict(deter=deter, stoch=stoch)
+    feat = dict(deter=deter, stoch=stoch, logit=logit)
+    entry = dict(deter=deter, stoch=stoch)
+    return carry, (entry, feat)
+
+  def _observe_parallel(self, carry, tokens, action, reset, training):
+    """Parallel observation over full sequence (for training)."""
+    B, T = tokens.shape[:2]
+
+    # Prepare inputs: concat deter, stoch, action for each timestep
+    # First step uses carry, subsequent steps use previous outputs
+    action_emb = nn.DictConcat(self.act_space, 1)(action)  # (B, T, A)
+    
+    # Embed tokens for all timesteps
+    tokens_flat = tokens.reshape((B, T, -1))
+
+    # Initial state embedding (prepend to sequence)
+    init_deter = carry['deter'][:, None, :]  # (B, 1, D)
+    init_stoch = carry['stoch'].reshape((B, 1, -1))  # (B, 1, S*C)
+
+    # For parallel processing, we embed all timesteps and let transformer handle causality
+    # Input at each position: [action_t, tokens_t]
+    inp = jnp.concatenate([action_emb, tokens_flat], -1)  # (B, T, A+Tok)
+    x = self.sub('obs_embed', nn.Linear, self.deter, **self.kw)(inp)
+
+    # Add initial state info by concatenating it
+    init_emb = jnp.concatenate([init_deter, init_stoch], -1)
+    init_emb = self.sub('init_embed', nn.Linear, self.deter, **self.kw)(init_emb)
+
+    # Prepend initial embedding to sequence
+    x = jnp.concatenate([init_emb, x], axis=1)  # (B, T+1, D)
+
+    # Apply transformer with causal attention (uses flash attention for memory efficiency)
+    kw = dict(bias=True, winit=self.kw.get('winit', 'trunc_normal_in'),
+              binit=self.kw.get('binit', 'zeros'))
+    ak = dict(heads=self.heads, rope=self.rope, qknorm=self.qknorm, causal=True)
+
+    for i in range(self.layers):
+      with nj.scope(f'layer{i}'):
+        skip = x
+        x = self.sub('norm1', nn.Norm, self.norm)(x)
+        x = self.sub('mha', nn.Attention, **kw, **ak)(x, training=training)
+        x += skip
+        skip = x
+        x = self.sub('norm2', nn.Norm, self.norm)(x)
+        D = x.shape[-1]
+        if self.glu:
+          U = max(D, int((D * self.ffup * 2 / 3) // 32 * 32))
+          ff1 = self.sub('ff1', nn.Linear, U, **kw)
+          ff2 = self.sub('ff2', nn.Linear, U, **kw)
+          ff3 = self.sub('ff3', nn.Linear, D, **kw)
+          x = ff3(nn.act(self.act)(ff1(x)) * ff2(x))
+        else:
+          ff1 = self.sub('ff1', nn.Linear, D * self.ffup, **kw)
+          ff2 = self.sub('ff2', nn.Linear, D, **kw)
+          x = ff2(nn.act(self.act)(ff1(x)))
+        x += skip
+
+    x = self.sub('outnorm', nn.Norm, self.norm)(x)
+
+    # Remove the prepended initial state
+    deter = x[:, 1:, :]  # (B, T, D)
+
+    # Compute posterior for each timestep
+    obs_inp = jnp.concatenate([deter, tokens_flat], -1)
+    for i in range(self.obslayers):
+      obs_inp = self.sub(f'obs{i}', nn.Linear, self.deter, **self.kw)(obs_inp)
+      obs_inp = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(obs_inp))
+    logit = self._logit('obslogit', obs_inp)
+    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+
+    # Build outputs
+    entries = dict(deter=deter, stoch=stoch)
+    feat = dict(deter=deter, stoch=stoch, logit=logit)
+    final_carry = dict(deter=deter[:, -1], stoch=stoch[:, -1])
+
+    return final_carry, entries, feat
+
+  def imagine(self, carry, policy, length, training, single=False):
+    """Imagination rollout - still sequential since policy depends on state."""
+    if single:
+      action = policy(sg(carry)) if callable(policy) else policy
+      actemb = nn.DictConcat(self.act_space, 1)(action)
+
+      # Single imagination step (same embedding as _observe_single)
+      stoch_flat = carry['stoch'].reshape((carry['stoch'].shape[0], -1))
+      x = jnp.concatenate([carry['deter'], stoch_flat, actemb], -1)
+      x = self.sub('imag_embed', nn.Linear, self.deter, **self.kw)(x)
+
+      # Apply transformer layers (no attention context in single step)
+      for i in range(self.layers):
+        with nj.scope(f'layer{i}'):
+          skip = x
+          x = self.sub('norm1', nn.Norm, self.norm)(x)
+          # Skip attention - no context
+          x = skip
+          skip = x
+          x = self.sub('norm2', nn.Norm, self.norm)(x)
+          if self.glu:
+            D = x.shape[-1]
+            U = max(D, int((D * self.ffup * 2 / 3) // 32 * 32))
+            ff1 = self.sub('ff1', nn.Linear, U, **self.kw)
+            ff2 = self.sub('ff2', nn.Linear, U, **self.kw)
+            ff3 = self.sub('ff3', nn.Linear, D, **self.kw)
+            x = ff3(nn.act(self.act)(ff1(x)) * ff2(x))
+          else:
+            ff1 = self.sub('ff1', nn.Linear, self.deter * self.ffup, **self.kw)
+            ff2 = self.sub('ff2', nn.Linear, self.deter, **self.kw)
+            x = ff2(nn.act(self.act)(ff1(x)))
+          x += skip
+      deter = self.sub('outnorm', nn.Norm, self.norm)(x)
+
+      # Prior (no observation)
+      logit = self._prior(deter)
+      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+
+      carry = nn.cast(dict(deter=deter, stoch=stoch))
+      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
+      return carry, (feat, action)
+    else:
+      # Sequential rollout
+      if callable(policy):
+        carry, (feat, action) = nj.scan(
+            lambda c, _: self.imagine(c, policy, 1, training, single=True),
+            nn.cast(carry), (), length, axis=1)
+      else:
+        carry, (feat, action) = nj.scan(
+            lambda c, a: self.imagine(c, a, 1, training, single=True),
+            nn.cast(carry), nn.cast(policy), length, axis=1)
+      return carry, feat, action
+
+  def loss(self, carry, tokens, acts, reset, training):
+    """Compute dynamics and representation losses."""
+    metrics = {}
+    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
+
+    # Prior prediction (from deter only)
+    prior = self._prior(feat['deter'])
+    post = feat['logit']
+
+    # KL losses
+    dyn = self._dist(sg(post)).kl(self._dist(prior))
+    rep = self._dist(post).kl(self._dist(sg(prior)))
+
+    if self.free_nats:
+      dyn = jnp.maximum(dyn, self.free_nats)
+      rep = jnp.maximum(rep, self.free_nats)
+
+    losses = {'dyn': dyn, 'rep': rep}
+    metrics['dyn_ent'] = self._dist(prior).entropy().mean()
+    metrics['rep_ent'] = self._dist(post).entropy().mean()
+
+    return carry, entries, losses, feat, metrics
+
+  def _prior(self, feat):
+    """Compute prior distribution from deterministic state."""
+    x = feat
+    for i in range(self.imglayers):
+      x = self.sub(f'prior{i}', nn.Linear, self.deter, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
+    return self._logit('priorlogit', x)
+
+  def _logit(self, name, x):
+    """Compute logits for stochastic distribution."""
+    kw = dict(**self.kw, outscale=self.outscale)
+    x = self.sub(name, nn.Linear, self.stoch * self.classes, **kw)(x)
+    return x.reshape(x.shape[:-1] + (self.stoch, self.classes))
+
+  def _dist(self, logits):
+    """Create categorical distribution with uniform mixing."""
+    out = embodied.jax.outs.OneHot(logits, self.unimix)
+    out = embodied.jax.outs.Agg(out, 1, jnp.sum)
+    return out
+
+
 class Encoder(nj.Module):
 
   units: int = 1024

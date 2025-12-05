@@ -155,6 +155,7 @@ def make_agent(config):
       report_length=config.report_length,
       replica=config.replica,
       replicas=config.replicas,
+      augment=config.augment,
   ))
 
 

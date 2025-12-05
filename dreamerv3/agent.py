@@ -11,6 +11,7 @@ import numpy as np
 import optax
 
 from . import rssm
+from . import augment
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -43,6 +44,7 @@ class Agent(embodied.jax.Agent):
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
         'rssm': rssm.RSSM,
+        'tssm': rssm.TSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
@@ -153,6 +155,8 @@ class Agent(embodied.jax.Agent):
     return carry, act, out
 
   def train(self, carry, data):
+    if self.config.augment.enabled:
+      data = augment.augment_batch(data, nj.seed(), self.config.augment)
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
     metrics, (carry, entries, outs, mets) = self.opt(
         self.loss, carry, obs, prevact, training=True, has_aux=True)
